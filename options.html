@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <title>Panopto 개념 정리 설정</title>
+    <link rel="stylesheet" href="options.css">
+  </head>
+  <body>
+    <main>
+      <h1>Panopto 개념 정리 설정</h1>
+
+      <label>
+        OpenAI API Key
+        <input id="openaiApiKey" type="password" autocomplete="off" placeholder="sk-...">
+      </label>
+
+      <label>
+        OpenAI Model
+        <input id="openaiModel" type="text" placeholder="gpt-5-mini">
+      </label>
+
+      <label>
+        Notion Internal Integration Token
+        <input id="notionApiKey" type="password" autocomplete="off" placeholder="ntn_... 또는 secret_...">
+      </label>
+
+      <label>
+        Notion 부모 페이지 ID 또는 URL
+        <input id="notionParentPageId" type="text" placeholder="Notion 페이지 URL을 붙여넣어도 됩니다">
+      </label>
+
+      <div class="actions">
+        <button id="save" type="button">저장</button>
+        <span id="status"></span>
+      </div>
+
+      <section>
+        <h2>Notion 준비</h2>
+        <p>Notion에서 새 통합을 만들고, 정리본을 넣을 페이지 오른쪽 위 메뉴에서 해당 통합을 초대해야 합니다.</p>
+      </section>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>
