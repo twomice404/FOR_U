@@ -20,11 +20,7 @@ Panopto 강의 페이지에서 자막/대본 텍스트를 모으고, 필요하�
 1. 크롬 주소창에 `chrome://extensions` 입력
 2. 오른쪽 위 `개발자 모드` 켜기
 3. `압축해제된 확장 프로그램을 로드합니다` 클릭
-4. 아래 폴더 선택
-
-```text
-C:\Users\leejuh\Desktop\기획조사 현장실습 이주희\작업\panopto-concept-helper
-```
+4. 폴더 선택
 
 ## 화면 구성
 
