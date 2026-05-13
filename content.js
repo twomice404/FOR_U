@@ -2,6 +2,20 @@
   const PANEL_ID = "panopto-concept-helper-panel";
   const TOGGLE_ID = "panopto-concept-helper-toggle";
   const MIN_TEXT_LENGTH = 80;
+  const LIVE_CAPTION_STORAGE_PREFIX = "panoptoLiveCaptionLines:";
+  let liveCaptionObserver = null;
+  let liveCaptionTimer = null;
+  let liveCaptionEnabled = false;
+  let liveCaptionPaused = true;
+
+  function getCurrentSessionId() {
+    const params = new URLSearchParams(location.search);
+    return params.get("id") || params.get("sessionId") || params.get("deliveryId") || "unknown-session";
+  }
+
+  function getLiveCaptionStorageKey() {
+    return `${LIVE_CAPTION_STORAGE_PREFIX}${getCurrentSessionId()}`;
+  }
 
   const STOPWORDS = new Set([
     "그리고", "그러면", "그런데", "하지만", "입니다", "합니다", "있습니다", "수",
@@ -10,6 +24,173 @@
     "영상", "강의", "오늘", "이번", "여기", "부분", "내용", "설명", "보시면",
     "이제", "다음", "하나", "있는지", "하면", "해서", "하고", "같은", "관련"
   ]);
+
+  const capturedPanoptoTexts = [];
+
+  function injectPageHook() {
+    try {
+      const script = document.createElement("script");
+      script.src = chrome.runtime.getURL("page-hook.js");
+      script.onload = () => script.remove();
+      (document.documentElement || document.head).appendChild(script);
+    } catch {
+      // The hook is a best-effort network capture layer.
+    }
+  }
+
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    if (event.data?.source !== "panopto-concept-helper-page-hook") return;
+    if (event.data?.type !== "captured-text") return;
+
+    const text = event.data.text || "";
+    if (text.length < 40) return;
+    capturedPanoptoTexts.push({ url: event.data.url || "", text, capturedAt: Date.now() });
+
+    if (capturedPanoptoTexts.length > 40) {
+      capturedPanoptoTexts.splice(0, capturedPanoptoTexts.length - 40);
+    }
+  });
+
+  injectPageHook();
+
+  function isTopFrame() {
+    return window.top === window;
+  }
+
+  async function addLiveCaptionLine(text) {
+    const clean = parseCaptionText(text);
+    if (!clean || clean.length < 2) return;
+
+    try {
+      const key = getLiveCaptionStorageKey();
+      const result = await getLocalSettings([key]);
+      const current = Array.isArray(result[key])
+        ? result[key]
+        : [];
+      const next = [...current];
+
+      clean.split("\n").forEach((line) => {
+        const normalized = normalizeText(line);
+        if (!normalized || next.includes(normalized)) return;
+        next.push(normalized);
+      });
+
+      await setLocalSettings({
+        [key]: next.slice(-2000)
+      });
+    } catch {
+      // Storage can be temporarily unavailable while the page is unloading.
+    }
+  }
+
+  function looksLikeCaptionText(text) {
+    const clean = normalizeText(text);
+    if (clean.length < 4 || clean.length > 260) return false;
+    if (/^(재생|일시정지|볼륨|설정|전체 화면|Panopto|Loading|Error)$/i.test(clean)) return false;
+    if (!/[가-힣a-zA-Z]/.test(clean)) return false;
+    return /[가-힣]/.test(clean) || /[.!?]$/.test(clean);
+  }
+
+  function collectVisibleCaptionCandidates() {
+    const chunks = [];
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+
+    document.querySelectorAll("body *").forEach((element) => {
+      if (!isVisible(element)) return;
+      const rect = element.getBoundingClientRect();
+      if (viewportHeight && rect.top < viewportHeight * 0.45) return;
+      if (rect.height > 160 || rect.width < 80) return;
+
+      const text = normalizeText(element.innerText || element.textContent || "");
+      if (looksLikeCaptionText(text)) chunks.push(text);
+    });
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  function sampleVideoBottomText() {
+    const chunks = [];
+    const videos = [...document.querySelectorAll("video")];
+    videos.forEach((video) => {
+      const rect = video.getBoundingClientRect();
+      if (rect.width < 80 || rect.height < 80) return;
+
+      const samplePoints = [
+        [rect.left + rect.width * 0.5, rect.bottom - rect.height * 0.08],
+        [rect.left + rect.width * 0.5, rect.bottom - rect.height * 0.15],
+        [rect.left + rect.width * 0.5, rect.bottom - rect.height * 0.22]
+      ];
+
+      samplePoints.forEach(([x, y]) => {
+        const element = document.elementFromPoint(x, y);
+        if (!element || element === video) return;
+        const text = normalizeText(element.innerText || element.textContent || "");
+        if (looksLikeCaptionText(text)) chunks.push(text);
+      });
+    });
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  function captureVisibleCaptionsOnce() {
+    if (liveCaptionPaused) return "";
+
+    const text = uniqueLines([
+      collectVisibleCaptionCandidates(),
+      sampleVideoBottomText(),
+      collectFromMediaTextTracks()
+    ].join("\n"));
+
+    if (text) addLiveCaptionLine(text);
+    return text;
+  }
+
+  function startLiveCaptionCapture() {
+    liveCaptionPaused = false;
+    if (liveCaptionEnabled) return;
+    liveCaptionEnabled = true;
+
+    captureVisibleCaptionsOnce();
+    liveCaptionObserver = new MutationObserver(() => {
+      captureVisibleCaptionsOnce();
+    });
+
+    if (document.body) {
+      liveCaptionObserver.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true
+      });
+    }
+
+    liveCaptionTimer = setInterval(captureVisibleCaptionsOnce, 1000);
+  }
+
+  function stopLiveCaptionCapture() {
+    liveCaptionPaused = true;
+    if (liveCaptionObserver) {
+      liveCaptionObserver.disconnect();
+      liveCaptionObserver = null;
+    }
+    if (liveCaptionTimer) {
+      clearInterval(liveCaptionTimer);
+      liveCaptionTimer = null;
+    }
+    liveCaptionEnabled = false;
+  }
+
+  function clearCurrentSessionLiveCaptions() {
+    return setLocalSettings({ [getLiveCaptionStorageKey()]: [] });
+  }
+
+  function pauseLiveCaptionCapture() {
+    liveCaptionPaused = true;
+  }
+
+  function resumeLiveCaptionCapture() {
+    startLiveCaptionCapture();
+  }
 
   function normalizeText(text) {
     return (text || "")
@@ -108,93 +289,452 @@
     return uniqueLines(chunks.join("\n"));
   }
 
-  function extractTranscript() {
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function collectOpenShadowRoots(root = document.documentElement, roots = []) {
+    if (!root) return roots;
+    const elements = root.querySelectorAll ? root.querySelectorAll("*") : [];
+    elements.forEach((element) => {
+      if (element.shadowRoot) {
+        roots.push(element.shadowRoot);
+        collectOpenShadowRoots(element.shadowRoot, roots);
+      }
+    });
+    return roots;
+  }
+
+  function collectFromShadowDom() {
+    const chunks = [];
+    collectOpenShadowRoots().forEach((root) => {
+      const text = normalizeText(root.textContent || "");
+      if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+    });
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  function parseCaptionText(text) {
+    return uniqueLines(
+      normalizeText(text)
+        .split("\n")
+        .filter((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return false;
+          if (/^WEBVTT/i.test(trimmed)) return false;
+          if (/^\d+$/.test(trimmed)) return false;
+          if (/^\d{1,2}:\d{2}(:\d{2})?[,.]\d{3}\s+-->\s+/.test(trimmed)) return false;
+          return true;
+        })
+        .join("\n")
+    );
+  }
+
+  function collectFromMediaTextTracks() {
+    const chunks = [];
+    const videos = [...document.querySelectorAll("video, audio")];
+
+    videos.forEach((media) => {
+      try {
+        [...(media.textTracks || [])].forEach((track) => {
+          try {
+            track.mode = "showing";
+          } catch {
+            try {
+              track.mode = "hidden";
+            } catch {
+              // Some tracks are readonly.
+            }
+          }
+
+          const cues = track.cues || track.activeCues || [];
+          [...cues].forEach((cue) => {
+            const text = cue.text || cue.getCueAsHTML?.().textContent || "";
+            if (text) chunks.push(text);
+          });
+        });
+      } catch {
+        // Cross-origin or not-yet-loaded tracks can be inaccessible.
+      }
+    });
+
+    document.querySelectorAll("track[src]").forEach((track) => {
+      const src = track.getAttribute("src");
+      if (src) chunks.push(src);
+    });
+
+    return parseCaptionText(chunks.join("\n"));
+  }
+
+  async function collectFromTrackElements() {
+    const chunks = [];
+    const tracks = [...document.querySelectorAll("track[src]")]
+      .map((track) => track.getAttribute("src"))
+      .filter(Boolean)
+      .slice(0, 12);
+
+    for (const src of tracks) {
+      try {
+        const url = new URL(src, location.href).href;
+        const text = parseCaptionText(await fetchText(url));
+        if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+      } catch {
+        // Track files may be protected or blob-backed.
+      }
+    }
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  function collectFromCapturedNetwork() {
+    const chunks = [];
+
+    capturedPanoptoTexts.forEach(({ text }) => {
+      if (!text) return;
+
+      const jsonStart = text.search(/[{[]/);
+      if (jsonStart >= 0) {
+        try {
+          const data = JSON.parse(text.slice(jsonStart));
+          chunks.push(...collectStringsFromObject(data));
+          return;
+        } catch {
+          // Treat it as plain text below.
+        }
+      }
+
+      chunks.push(parseCaptionText(text));
+    });
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  async function fetchText(url) {
+    const response = await fetch(url, { credentials: "include" });
+    if (!response.ok) return "";
+    return response.text();
+  }
+
+  async function collectFromDownloadLinks() {
+    const chunks = [];
+    const linkPattern = /(caption|transcript|subtitle|download|smi|srt|vtt|자막|대본)/i;
+    const links = [...document.querySelectorAll("a[href], button[data-href]")]
+      .map((element) => element.href || element.dataset.href || "")
+      .filter((href) => href && linkPattern.test(href))
+      .slice(0, 12);
+
+    for (const href of links) {
+      try {
+        const url = new URL(href, location.href).href;
+        const text = parseCaptionText(await fetchText(url));
+        if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+      } catch {
+        // Some Panopto controls expose pseudo-links that cannot be fetched directly.
+      }
+    }
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  function findCandidateGuids(text) {
+    const found = new Set();
+    const guidPattern = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g;
+    for (const match of text.matchAll(guidPattern)) {
+      found.add(match[0]);
+    }
+    return [...found];
+  }
+
+  function collectGuidsFromPage() {
     const sources = [
+      location.href,
+      document.documentElement.innerHTML,
+      ...[...document.querySelectorAll("script")].map((script) => script.textContent || "")
+    ];
+
+    return [...new Set(sources.flatMap(findCandidateGuids))].slice(0, 20);
+  }
+
+  function getSessionIdsFromUrlAndPage() {
+    const ids = new Set();
+    const params = new URLSearchParams(location.search);
+
+    ["id", "sessionId", "deliveryId"].forEach((key) => {
+      const value = params.get(key);
+      if (value) ids.add(value);
+    });
+
+    collectGuidsFromPage().forEach((guid) => ids.add(guid));
+    return [...ids].slice(0, 20);
+  }
+
+  function collectStringsFromObject(value, chunks = []) {
+    if (!value) return chunks;
+    if (typeof value === "string") {
+      const text = parseCaptionText(value);
+      if (text.length >= 8) chunks.push(text);
+      return chunks;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => collectStringsFromObject(item, chunks));
+      return chunks;
+    }
+    if (typeof value === "object") {
+      Object.entries(value).forEach(([key, child]) => {
+        if (/caption|transcript|subtitle|event|text|query/i.test(key)) {
+          collectStringsFromObject(child, chunks);
+        } else if (typeof child === "object") {
+          collectStringsFromObject(child, chunks);
+        }
+      });
+    }
+    return chunks;
+  }
+
+  async function collectFromPanoptoDeliveryInfo() {
+    const chunks = [];
+    const guids = collectGuidsFromPage();
+    const endpointPath = "/Panopto/Pages/Viewer/DeliveryInfo.aspx";
+
+    for (const guid of guids) {
+      const urls = [
+        `${endpointPath}?deliveryId=${encodeURIComponent(guid)}&responseType=json`,
+        `${endpointPath}?deliveryId=${encodeURIComponent(guid)}`,
+        `${endpointPath}?sessionId=${encodeURIComponent(guid)}&responseType=json`,
+        `${endpointPath}?id=${encodeURIComponent(guid)}&responseType=json`
+      ].map((path) => new URL(path, location.origin).href);
+
+      for (const url of urls) {
+        try {
+          const raw = await fetchText(url);
+          if (!raw || raw.length < MIN_TEXT_LENGTH) continue;
+
+          const jsonStart = raw.search(/[{[]/);
+          if (jsonStart >= 0) {
+            try {
+              const data = JSON.parse(raw.slice(jsonStart));
+              const text = uniqueLines(collectStringsFromObject(data).join("\n"));
+              if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+            } catch {
+              const text = parseCaptionText(raw);
+              if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+            }
+          }
+        } catch {
+          // Candidate GUIDs may not all be delivery IDs. Try the next one.
+        }
+      }
+    }
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  async function collectFromPanoptoCaptionDownloads() {
+    const chunks = [];
+    const ids = getSessionIdsFromUrlAndPage();
+    const languageValues = [
+      "0",
+      "1",
+      "Korean_Korea",
+      "Korean",
+      "ko-KR",
+      "ko",
+      "English_USA",
+      "English",
+      "en-US",
+      "en"
+    ];
+
+    for (const id of ids) {
+      const urls = [];
+
+      languageValues.forEach((language) => {
+        urls.push(new URL(`/Panopto/Pages/Transcription/GenerateSRT.ashx?id=${encodeURIComponent(id)}&language=${encodeURIComponent(language)}`, location.origin).href);
+        urls.push(new URL(`/Panopto/Pages/Transcription/GenerateVTT.ashx?id=${encodeURIComponent(id)}&language=${encodeURIComponent(language)}`, location.origin).href);
+        urls.push(new URL(`/Panopto/Pages/Transcription/GenerateTXT.ashx?id=${encodeURIComponent(id)}&language=${encodeURIComponent(language)}`, location.origin).href);
+      });
+
+      urls.push(new URL(`/Panopto/api/v1/sessions/${encodeURIComponent(id)}`, location.origin).href);
+      urls.push(new URL(`/Panopto/Services/Data.svc/GetSessionById?id=${encodeURIComponent(id)}`, location.origin).href);
+
+      for (const url of urls) {
+        try {
+          const raw = await fetchText(url);
+          if (!raw || raw.length < MIN_TEXT_LENGTH) continue;
+
+          if (/\/api\/v1\/sessions\/|\/Services\/Data\.svc\/GetSessionById/i.test(url)) {
+            try {
+              const data = JSON.parse(raw);
+              const downloadUrl =
+                data.CaptionDownloadUrl ||
+                data.captionDownloadUrl ||
+                data.CaptionsUrl ||
+                data.captionsUrl ||
+                data?.d?.CaptionDownloadUrl ||
+                data?.d?.captionDownloadUrl ||
+                data?.d?.CaptionsUrl ||
+                data?.d?.captionsUrl;
+
+              if (downloadUrl) {
+                const captionText = parseCaptionText(await fetchText(new URL(downloadUrl, location.origin).href));
+                if (captionText.length >= MIN_TEXT_LENGTH) chunks.push(captionText);
+              }
+
+              const embedded = uniqueLines(collectStringsFromObject(data).join("\n"));
+              if (embedded.length >= MIN_TEXT_LENGTH) chunks.push(embedded);
+            } catch {
+              const text = parseCaptionText(raw);
+              if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+            }
+          } else {
+            const text = parseCaptionText(raw);
+            if (text.length >= MIN_TEXT_LENGTH) chunks.push(text);
+          }
+        } catch {
+          // Some caption URLs return an empty response when viewer permissions do not include download access.
+        }
+      }
+    }
+
+    return uniqueLines(chunks.join("\n"));
+  }
+
+  function clickTranscriptControls() {
+    const controlPattern = /(cc|caption|captions|transcript|subtitle|subtitles|자막|대본|스크립트)/i;
+    const candidates = [...document.querySelectorAll("button, a, [role='button'], [tabindex]")]
+      .filter((element) => {
+        const label = [
+          element.innerText,
+          element.textContent,
+          element.getAttribute("aria-label"),
+          element.getAttribute("title")
+        ].join(" ");
+        return controlPattern.test(label);
+      })
+      .slice(0, 5);
+
+    candidates.forEach((element) => {
+      try {
+        element.click();
+      } catch {
+        // Ignore blocked synthetic clicks.
+      }
+    });
+
+    return candidates.length;
+  }
+
+  function extractTranscript() {
+    const primarySources = [
+      collectFromMediaTextTracks(),
+      collectFromCapturedNetwork(),
       collectFromTranscriptLikeNodes(),
       collectFromScripts(),
-      collectFromPageTextFallback()
+      collectFromShadowDom()
     ].filter((text) => text.length >= MIN_TEXT_LENGTH);
 
-    if (!sources.length) return "";
+    if (primarySources.length) {
+      return primarySources.sort((a, b) => b.length - a.length)[0];
+    }
+
+    const fallback = collectFromPageTextFallback();
+    return fallback.length >= MIN_TEXT_LENGTH ? fallback : "";
+  }
+
+  async function loadStoredLiveCaptions() {
+    const key = getLiveCaptionStorageKey();
+    const result = await getLocalSettings([key]);
+    const lines = Array.isArray(result[key])
+      ? result[key]
+      : [];
+    return uniqueLines(lines.join("\n"));
+  }
+
+  async function extractTranscriptDeep() {
+    const firstPass = extractTranscript();
+    if (firstPass.length >= 500) return firstPass;
+
+    const clickedCount = clickTranscriptControls();
+    if (clickedCount > 0) {
+      await sleep(1800);
+    }
+
+    const sources = [
+      extractTranscript(),
+      await loadStoredLiveCaptions(),
+      await collectFromTrackElements(),
+      await collectFromPanoptoCaptionDownloads(),
+      await collectFromDownloadLinks(),
+      await collectFromPanoptoDeliveryInfo()
+    ].filter((text) => text.length >= MIN_TEXT_LENGTH);
+
+    if (!sources.length) return firstPass;
     return sources.sort((a, b) => b.length - a.length)[0];
   }
 
-  function splitSentences(text) {
-    return normalizeText(text)
-      .replace(/\n+/g, " ")
-      .split(/(?<=[.!?。！？]|다\.|요\.|죠\.|니다\.)\s+/)
-      .map((sentence) => sentence.trim())
-      .filter((sentence) => sentence.length >= 18);
+  function getExtractionDiagnostics() {
+    const mediaCount = document.querySelectorAll("video, audio").length;
+    const trackElementCount = document.querySelectorAll("track[src]").length;
+    const textTrackCount = [...document.querySelectorAll("video, audio")]
+      .reduce((sum, media) => sum + ((media.textTracks && media.textTracks.length) || 0), 0);
+    const sessionIdCount = getSessionIdsFromUrlAndPage().length;
+    return `진단: media ${mediaCount}, track ${trackElementCount}, textTracks ${textTrackCount}, captured ${capturedPanoptoTexts.length}, sessionIds ${sessionIdCount}`;
   }
 
-  function tokenize(text) {
-    return normalizeText(text)
-      .toLowerCase()
-      .match(/[가-힣a-zA-Z0-9]{2,}/g)
-      ?.filter((word) => !STOPWORDS.has(word) && !/^\d+$/.test(word)) || [];
+  function looksLikeNoiseLine(line) {
+    const normalized = normalizeText(line);
+    if (!normalized) return true;
+    const lower = normalized.toLowerCase();
+    const exactNoise = new Set([
+      "재생", "일시정지", "볼륨", "음소거", "설정", "전체 화면", "전체화면", "자막", "닫기", "열기", "로딩",
+      "loading", "captions", "download transcript", "downloading transcript...", "edit language:", "add new language:",
+      "position", "open captions settings menu", "dock below video", "overlay on video",
+      "dark text on light background", "light text on dark background", "light text with shadow, no background",
+      "밝은 배경에 어두운 텍스트", "어두운 배경에 밝은 텍스트", "비디오 아래에 도킹", "비디오에 오버레이",
+      "자막 설정 메뉴 열기", "기록을 다운로드하는 중...", "새 언어 추가:"
+    ]);
+    if (exactNoise.has(normalized) || exactNoise.has(lower)) return true;
+    if (/^\[?자동 생성된 (대화 내용|자막|기록).*\]?$/i.test(normalized)) return true;
+    if (/^\[?auto-generated (transcript|captions?).*\]?$/i.test(normalized)) return true;
+    if (/auto-generated captions may contain errors/i.test(normalized)) return true;
+    if (/^(재생|일시정지|볼륨|음소거|설정|전체 화면|전체화면|자막|닫기|열기|로딩|Loading)$/i.test(normalized)) return true;
+    if (/^(슬라이드|화면|이미지|그림|사진|표|도표|그래프)\s*\d*/i.test(normalized)) return true;
+    if (/(이미지|그림|사진|아이콘|버튼|화면|슬라이드).{0,12}(설명|표시|보임|나타남|묘사)/i.test(normalized)) return true;
+    if (/(접근성|시각장애|청각장애|스크린 리더|대체 텍스트|alt text|audio description|오디오 설명)/i.test(normalized)) return true;
+    if (/^\d{1,2}:\d{2}(:\d{2})?/.test(normalized)) return true;
+    return false;
   }
 
-  function scoreKeywords(text) {
-    const counts = new Map();
-    tokenize(text).forEach((word) => {
-      counts.set(word, (counts.get(word) || 0) + 1);
-    });
-
-    return [...counts.entries()]
-      .map(([word, count]) => ({ word, count, score: count * Math.min(word.length, 8) }))
-      .sort((a, b) => b.score - a.score || b.count - a.count)
-      .slice(0, 18);
-  }
-
-  function pickCoreSentences(sentences, keywords) {
-    const keywordSet = new Set(keywords.slice(0, 12).map((item) => item.word));
-    return sentences
-      .map((sentence, index) => {
-        const words = tokenize(sentence);
-        const keywordHits = words.filter((word) => keywordSet.has(word)).length;
-        const lengthScore = sentence.length >= 45 && sentence.length <= 180 ? 2 : 0;
-        return { sentence, index, score: keywordHits * 3 + lengthScore };
-      })
-      .sort((a, b) => b.score - a.score || a.index - b.index)
-      .slice(0, 8)
-      .sort((a, b) => a.index - b.index)
-      .map((item) => item.sentence);
-  }
-
-  function summarizeConcepts(text) {
+  function tidyTranscript(text) {
     const cleanText = normalizeText(text);
-    const sentences = splitSentences(cleanText);
-    const keywords = scoreKeywords(cleanText);
-    const coreSentences = pickCoreSentences(sentences, keywords);
-    const title = document.title.replace(/\s*-\s*Panopto.*$/i, "").trim() || "Panopto 강의";
 
     if (cleanText.length < MIN_TEXT_LENGTH) {
-      return "정리할 텍스트가 너무 짧습니다. Panopto에서 대본을 다운로드한 뒤 붙여넣어 주세요.";
+      return "정돈할 텍스트가 너무 짧습니다. 대본을 먼저 추출하거나 붙여넣어 주세요.";
     }
 
-    const keywordLine = keywords.slice(0, 12).map((item) => item.word).join(", ");
-    const conceptNotes = coreSentences.length
-      ? coreSentences.map((sentence) => `- ${sentence}`).join("\n")
-      : "- 핵심 문장을 충분히 찾지 못했습니다. 대본 텍스트를 더 길게 붙여넣어 주세요.";
-    const questions = keywords.slice(0, 5)
-      .map((item) => `- ${item.word}의 의미와 강의에서의 역할은 무엇인가?`)
-      .join("\n");
+    const lines = cleanText
+      .split(/\n+/)
+      .map((line) => normalizeText(line))
+      .filter((line) => !looksLikeNoiseLine(line));
 
-    return [
-      `# ${title} 개념 정리`,
-      "",
-      "## 핵심 키워드",
-      keywordLine || "- 추출된 키워드 없음",
-      "",
-      "## 개념 요약",
-      conceptNotes,
-      "",
-      "## 복습 질문",
-      questions || "- 강의의 핵심 주장과 근거는 무엇인가?",
-      "",
-      "## 원문 길이",
-      `- 약 ${cleanText.length.toLocaleString("ko-KR")}자`
-    ].join("\n");
+    const merged = [];
+    lines.forEach((line) => {
+      if (!line) return;
+      const previous = merged[merged.length - 1] || "";
+      const shouldAppend =
+        previous &&
+        previous.length < 90 &&
+        !/[.!?。！？]$/.test(previous) &&
+        !/^(그리고|그런데|하지만|또한|그래서|따라서|즉|예를 들어)/.test(line);
+
+      if (shouldAppend) {
+        merged[merged.length - 1] = `${previous} ${line}`;
+      } else {
+        merged.push(line);
+      }
+    });
+
+    return uniqueLines(merged.join("\n"));
   }
 
   async function copyToClipboard(text) {
@@ -211,6 +751,56 @@
         resolve(response);
       });
     });
+  }
+
+  function getLocalSetting(key) {
+    return new Promise((resolve) => {
+      chrome.storage.local.get([key], (items) => {
+        resolve(items[key] || "");
+      });
+    });
+  }
+
+  function getLocalSettings(keys) {
+    return new Promise((resolve) => {
+      chrome.storage.local.get(keys, (items) => {
+        resolve(items || {});
+      });
+    });
+  }
+
+  function setLocalSettings(items) {
+    return new Promise((resolve) => {
+      chrome.storage.local.set(items, () => {
+        resolve(!chrome.runtime.lastError);
+      });
+    });
+  }
+
+  function buildChatGptPrompt(transcript) {
+    const title = document.title.replace(/\s*-\s*Panopto.*$/i, "").trim() || "Panopto 강의";
+    return [
+      "아래 Panopto 강의 대본을 바탕으로 대학 수업 복습용 개념 정리본을 만들어줘.",
+      "",
+      "요구사항:",
+      "- 한국어로 작성",
+      "- 대본에 없는 내용은 추측하지 않기",
+      "- 대본 문장을 근거로 하되, 오탈자와 띄어쓰기만 자연스럽게 정돈",
+      "- 화면 오브젝트 설명, 접근성용 설명, 조작 버튼 설명은 제외",
+      "- 핵심 요약",
+      "- 주요 개념",
+      "- 강의 흐름",
+      "- 시험/복습 포인트",
+      "- 헷갈리기 쉬운 점",
+      "- 복습 질문",
+      "- Notion에 붙여넣기 좋은 Markdown 형식",
+      "",
+      `강의 제목: ${title}`,
+      `강의 링크: ${location.href}`,
+      "",
+      "대본:",
+      transcript
+    ].join("\n");
   }
 
   function downloadMarkdown(text) {
@@ -243,15 +833,93 @@
       </div>
       <div class="panopto-helper-body">
         <div class="panopto-helper-actions">
-          <button class="panopto-helper-button primary" type="button" data-action="extract">대본 추출</button>
-          <button class="panopto-helper-button" type="button" data-action="summarize">개념 정리</button>
-          <button class="panopto-helper-button primary" type="button" data-action="upload-notion">GPT+Notion 업로드</button>
-          <button class="panopto-helper-button" type="button" data-action="copy">결과 복사</button>
-          <button class="panopto-helper-button" type="button" data-action="download">Markdown 저장</button>
+          <button class="panopto-helper-button tab is-active" type="button" data-section="text" data-action="show-section">텍스트</button>
+          <button class="panopto-helper-button tab" type="button" data-section="send" data-action="show-section">전송</button>
+          <button class="panopto-helper-button tab" type="button" data-section="settings" data-action="show-section">설정</button>
         </div>
         <div class="panopto-helper-status"></div>
-        <textarea class="panopto-helper-textarea" placeholder="대본이 자동 추출되지 않으면 Panopto에서 Download transcript로 받은 텍스트를 여기에 붙여넣으세요."></textarea>
-        <pre class="panopto-helper-output"></pre>
+
+        <div class="panopto-helper-section is-active" data-panel-section="text">
+          <div class="panopto-helper-section-title">텍스트 추출과 정돈</div>
+          <div class="panopto-helper-subactions">
+            <button class="panopto-helper-button primary" type="button" data-action="extract">대본 추출</button>
+            <button class="panopto-helper-button" type="button" data-action="tidy">문장 정돈</button>
+            <button class="panopto-helper-button" type="button" data-action="toggle-live-captions">재생 자막 캡처 시작</button>
+            <button class="panopto-helper-button" type="button" data-action="load-live-captions">누적 자막 불러오기</button>
+            <button class="panopto-helper-button" type="button" data-action="clear-live-captions">누적 초기화</button>
+          </div>
+          <div class="panopto-helper-collapsible" data-collapsible="transcript">
+            <button class="panopto-helper-collapse-bar" type="button" data-action="toggle-collapse" data-target="transcript">
+              <span class="panopto-helper-chevron">›</span>
+              <span>대본 텍스트</span>
+            </button>
+            <div class="panopto-helper-collapsible-content">
+              <textarea class="panopto-helper-textarea" placeholder="대본이 자동 추출되지 않으면 Panopto에서 Download transcript로 받은 텍스트를 여기에 붙여넣으세요."></textarea>
+              <div class="panopto-helper-transcript-actions" hidden>
+                <button class="panopto-helper-button" type="button" data-action="copy-transcript">대본 복사</button>
+                <button class="panopto-helper-button" type="button" data-action="download-transcript">대본 저장</button>
+              </div>
+            </div>
+          </div>
+          <div class="panopto-helper-collapsible" data-collapsible="result">
+            <button class="panopto-helper-collapse-bar" type="button" data-action="toggle-collapse" data-target="result">
+              <span class="panopto-helper-chevron">›</span>
+              <span>정돈 결과</span>
+            </button>
+            <div class="panopto-helper-collapsible-content">
+              <pre class="panopto-helper-output"></pre>
+              <div class="panopto-helper-result-actions" hidden>
+                <button class="panopto-helper-button" type="button" data-action="copy-result">정리본 복사</button>
+                <button class="panopto-helper-button" type="button" data-action="download-result">정리본 저장</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panopto-helper-section" data-panel-section="send">
+          <div class="panopto-helper-section-title">GPT 정리와 Notion 전송</div>
+          <div class="panopto-helper-upload-panel">
+            <button class="panopto-helper-button primary" type="button" data-action="upload-notion">GPT로 정리해서 Notion 업로드</button>
+            <button class="panopto-helper-button" type="button" data-action="chatgpt-project">ChatGPT 프로젝트에서 정리</button>
+          </div>
+          <div class="panopto-helper-project-panel" hidden>
+            <label>
+              ChatGPT 프로젝트 URL
+              <input type="url" data-project-url placeholder="https://chatgpt.com/...">
+            </label>
+            <div class="panopto-helper-inline-actions">
+              <button class="panopto-helper-button primary" type="button" data-action="open-chatgpt-project">저장 후 프로젝트 열기</button>
+              <button class="panopto-helper-button" type="button" data-action="close-chatgpt-project">닫기</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panopto-helper-section" data-panel-section="settings">
+          <div class="panopto-helper-section-title">연동 설정</div>
+          <div class="panopto-helper-settings">
+            <label>
+              OpenAI API Key
+              <input type="password" data-setting="openaiApiKey" placeholder="sk-...">
+            </label>
+            <label>
+              OpenAI Model
+              <input type="text" data-setting="openaiModel" placeholder="gpt-5-mini">
+            </label>
+            <label>
+              Notion Integration Token
+              <input type="password" data-setting="notionApiKey" placeholder="ntn_... 또는 secret_...">
+            </label>
+            <label>
+              Notion 부모 페이지 URL 또는 ID
+              <input type="text" data-setting="notionParentPageId" placeholder="Notion 페이지 URL을 붙여넣으세요">
+            </label>
+            <label>
+              ChatGPT 프로젝트 URL
+              <input type="url" data-setting="chatgptProjectUrl" placeholder="https://chatgpt.com/...">
+            </label>
+            <button class="panopto-helper-button primary" type="button" data-action="save-settings">설정 저장</button>
+          </div>
+        </div>
       </div>
     `;
 
@@ -260,6 +928,84 @@
     const textarea = panel.querySelector(".panopto-helper-textarea");
     const output = panel.querySelector(".panopto-helper-output");
     const status = panel.querySelector(".panopto-helper-status");
+    const settingsPanel = panel.querySelector(".panopto-helper-settings");
+    const projectPanel = panel.querySelector(".panopto-helper-project-panel");
+    const projectUrlInput = panel.querySelector("[data-project-url]");
+    const transcriptActions = panel.querySelector(".panopto-helper-transcript-actions");
+    const resultActions = panel.querySelector(".panopto-helper-result-actions");
+    const liveCaptionButton = panel.querySelector('[data-action="toggle-live-captions"]');
+
+    function updateLiveCaptionButton() {
+      if (!liveCaptionButton) return;
+      liveCaptionButton.classList.toggle("is-recording", !liveCaptionPaused);
+      liveCaptionButton.textContent = liveCaptionPaused
+        ? "재생 자막 캡처 시작"
+        : "재생 자막 캡처 중";
+    }
+
+    function setCollapsed(target, collapsed) {
+      const wrapper = panel.querySelector(`[data-collapsible="${target}"]`);
+      if (!wrapper) return;
+      wrapper.classList.toggle("is-collapsed", collapsed);
+    }
+
+    function showSection(section) {
+      panel.querySelectorAll("[data-panel-section]").forEach((sectionElement) => {
+        sectionElement.classList.toggle("is-active", sectionElement.dataset.panelSection === section);
+      });
+      panel.querySelectorAll("[data-section]").forEach((button) => {
+        button.classList.toggle("is-active", button.dataset.section === section);
+      });
+      setStatus(`${section === "text" ? "텍스트" : section === "send" ? "전송" : "설정"} 화면입니다.`);
+    }
+
+    function markWorking(action) {
+      panel.querySelectorAll("[data-action]").forEach((button) => {
+        button.classList.toggle("is-working", button.dataset.action === action);
+      });
+    }
+
+    async function loadSettingsIntoPanel() {
+      const settings = await getLocalSettings([
+        "openaiApiKey",
+        "openaiModel",
+        "notionApiKey",
+        "notionParentPageId",
+        "chatgptProjectUrl"
+      ]);
+
+      settingsPanel.querySelector('[data-setting="openaiApiKey"]').value = settings.openaiApiKey || "";
+      settingsPanel.querySelector('[data-setting="openaiModel"]').value = settings.openaiModel || "gpt-5-mini";
+      settingsPanel.querySelector('[data-setting="notionApiKey"]').value = settings.notionApiKey || "";
+      settingsPanel.querySelector('[data-setting="notionParentPageId"]').value = settings.notionParentPageId || "";
+      settingsPanel.querySelector('[data-setting="chatgptProjectUrl"]').value = settings.chatgptProjectUrl || "";
+    }
+
+    async function saveSettingsFromPanel() {
+      const items = {};
+      settingsPanel.querySelectorAll("[data-setting]").forEach((input) => {
+        items[input.dataset.setting] = input.value.trim();
+      });
+
+      if (!items.openaiModel) {
+        items.openaiModel = "gpt-5-mini";
+      }
+
+      const saved = await setLocalSettings(items);
+      setStatus(saved ? "설정을 저장했습니다." : "설정 저장에 실패했습니다.");
+    }
+
+    async function loadStoredLiveCaptions() {
+      const result = await getLocalSettings([LIVE_CAPTION_STORAGE_KEY]);
+      const lines = Array.isArray(result[LIVE_CAPTION_STORAGE_KEY])
+        ? result[LIVE_CAPTION_STORAGE_KEY]
+        : [];
+      return uniqueLines(lines.join("\n"));
+    }
+
+    async function clearStoredLiveCaptions() {
+      await clearCurrentSessionLiveCaptions();
+    }
 
     function setStatus(message) {
       status.textContent = message;
@@ -278,24 +1024,137 @@
       if (!button) return;
 
       const action = button.dataset.action;
-      if (action === "extract") {
-        const extracted = extractTranscript();
-        textarea.value = extracted;
-        setStatus(extracted ? `대본 후보를 ${extracted.length.toLocaleString("ko-KR")}자 추출했습니다.` : "자동 추출에 실패했습니다. Panopto 대본 다운로드 텍스트를 붙여넣어 주세요.");
+      if (action === "show-section") {
+        showSection(button.dataset.section);
+        if (button.dataset.section === "settings") {
+          await loadSettingsIntoPanel();
+        }
+        return;
       }
 
-      if (action === "summarize") {
-        output.textContent = summarizeConcepts(textarea.value);
-        setStatus("개념 정리를 만들었습니다.");
+      if (action === "toggle-collapse") {
+        const target = button.dataset.target;
+        const wrapper = panel.querySelector(`[data-collapsible="${target}"]`);
+        if (wrapper) {
+          wrapper.classList.toggle("is-collapsed");
+        }
+        return;
+      }
+
+      if (action === "extract") {
+        button.disabled = true;
+        markWorking(action);
+        startLiveCaptionCapture();
+        setStatus("대본을 찾는 중입니다. 자막/대본 패널, 영상 자막 트랙, 재생 중 자막을 함께 확인합니다.");
+        try {
+          const extracted = await extractTranscriptDeep();
+          textarea.value = extracted;
+          transcriptActions.hidden = !extracted;
+          if (extracted) setCollapsed("transcript", false);
+          setStatus(extracted ? `대본 후보를 ${extracted.length.toLocaleString("ko-KR")}자 추출했습니다.` : `자동 추출에 실패했습니다. ${getExtractionDiagnostics()}`);
+        } catch (error) {
+          setStatus(error.message || String(error));
+        } finally {
+          markWorking("");
+          button.disabled = false;
+        }
+      }
+
+      if (action === "tidy") {
+        markWorking(action);
+        output.textContent = tidyTranscript(textarea.value);
+        resultActions.hidden = !output.textContent.trim();
+        if (output.textContent.trim()) setCollapsed("result", false);
+        setStatus("문장을 크게 바꾸지 않고 줄 정리와 불필요한 설명 제거만 적용했습니다.");
+        markWorking("");
+      }
+
+      if (action === "toggle-live-captions") {
+        if (liveCaptionPaused) {
+          resumeLiveCaptionCapture();
+          setStatus("재생 중인 자막을 누적 캡처하는 중입니다. 다시 누르면 일시중지합니다.");
+        } else {
+          pauseLiveCaptionCapture();
+          setStatus("재생 자막 캡처를 일시중지했습니다. 다시 누르면 이어서 캡처합니다.");
+        }
+        updateLiveCaptionButton();
+      }
+
+      if (action === "load-live-captions") {
+        const captured = await loadStoredLiveCaptions();
+        if (captured) {
+          textarea.value = captured;
+          transcriptActions.hidden = false;
+          setCollapsed("transcript", false);
+          setStatus(`누적 자막 ${captured.length.toLocaleString("ko-KR")}자를 불러왔습니다.`);
+        } else {
+          setStatus(`누적된 자막이 없습니다. ${getExtractionDiagnostics()}`);
+        }
+      }
+
+      if (action === "clear-live-captions") {
+        await clearStoredLiveCaptions();
+        setStatus("누적 자막을 초기화했습니다.");
+      }
+
+      if (action === "toggle-settings") {
+        showSection("settings");
+        await loadSettingsIntoPanel();
+      }
+
+      if (action === "save-settings") {
+        markWorking(action);
+        await saveSettingsFromPanel();
+        markWorking("");
+      }
+
+      if (action === "chatgpt-project") {
+        projectPanel.hidden = false;
+        projectUrlInput.value = await getLocalSetting("chatgptProjectUrl");
+        projectUrlInput.focus();
+        setStatus("ChatGPT 프로젝트 링크를 확인한 뒤 프로젝트를 여세요.");
+      }
+
+      if (action === "close-chatgpt-project") {
+        projectPanel.hidden = true;
+      }
+
+      if (action === "open-chatgpt-project") {
+        button.disabled = true;
+        markWorking(action);
+        setStatus("ChatGPT 프로젝트에 붙여넣을 프롬프트를 준비하는 중입니다.");
+
+        try {
+          const projectUrl = projectUrlInput.value.trim();
+          await setLocalSettings({ chatgptProjectUrl: projectUrl });
+
+          if (!textarea.value.trim()) {
+            textarea.value = await extractTranscriptDeep();
+          }
+
+          if (!textarea.value.trim()) {
+            throw new Error("대본을 먼저 추출하거나 붙여넣어 주세요.");
+          }
+
+          await copyToClipboard(buildChatGptPrompt(textarea.value));
+          window.open(projectUrl || "https://chatgpt.com/", "_blank", "noopener,noreferrer");
+          setStatus("프롬프트를 복사했고 ChatGPT를 열었습니다. 프로젝트 채팅 입력창에 붙여넣으면 됩니다.");
+        } catch (error) {
+          setStatus(error.message || String(error));
+        } finally {
+          markWorking("");
+          button.disabled = false;
+        }
       }
 
       if (action === "upload-notion") {
         button.disabled = true;
+        markWorking(action);
         setStatus("OpenAI로 정리한 뒤 Notion에 업로드하는 중입니다.");
 
         try {
           if (!textarea.value.trim()) {
-            textarea.value = extractTranscript();
+            textarea.value = await extractTranscriptDeep();
           }
 
           const response = await sendRuntimeMessage({
@@ -312,40 +1171,83 @@
           }
 
           output.textContent = response.result.summary;
+          resultActions.hidden = !output.textContent.trim();
+          if (output.textContent.trim()) setCollapsed("result", false);
           const notionUrl = response.result.notionUrl;
           setStatus(notionUrl ? `Notion 업로드 완료: ${notionUrl}` : "Notion 업로드 완료");
         } catch (error) {
+          if (/OpenAI API 키|Notion API 키|부모 페이지 ID|설정/.test(error.message || "")) {
+            showSection("settings");
+            await loadSettingsIntoPanel();
+          }
           setStatus(error.message || String(error));
         } finally {
+          markWorking("");
           button.disabled = false;
         }
       }
 
-      if (action === "copy") {
-        const text = output.textContent || "";
+      if (action === "copy-transcript") {
+        const text = textarea.value || "";
         if (!text.trim()) {
-          setStatus("복사할 결과가 없습니다.");
+          setStatus("복사할 대본이 없습니다.");
           return;
         }
         await copyToClipboard(text);
-        setStatus("결과를 클립보드에 복사했습니다.");
+        setStatus("대본을 클립보드에 복사했습니다.");
       }
 
-      if (action === "download") {
-        const text = output.textContent || "";
+      if (action === "download-transcript") {
+        const text = textarea.value || "";
         if (!text.trim()) {
-          setStatus("저장할 결과가 없습니다.");
+          setStatus("저장할 대본이 없습니다.");
           return;
         }
         downloadMarkdown(text);
-        setStatus("Markdown 파일로 저장했습니다.");
+        setStatus("대본을 Markdown 파일로 저장했습니다.");
+      }
+
+      if (action === "copy-result") {
+        const text = output.textContent || "";
+        if (!text.trim()) {
+          setStatus("복사할 정리본이 없습니다.");
+          return;
+        }
+        await copyToClipboard(text);
+        setStatus("정리본을 클립보드에 복사했습니다.");
+      }
+
+      if (action === "download-result") {
+        const text = output.textContent || "";
+        if (!text.trim()) {
+          setStatus("저장할 정리본이 없습니다.");
+          return;
+        }
+        downloadMarkdown(text);
+        setStatus("정리본을 Markdown 파일로 저장했습니다.");
       }
     });
   }
 
+  function boot() {
+    if (isTopFrame()) {
+      createPanel();
+    }
+  }
+
+  window.addEventListener("pagehide", () => {
+    stopLiveCaptionCapture();
+    clearCurrentSessionLiveCaptions();
+  });
+
+  window.addEventListener("beforeunload", () => {
+    stopLiveCaptionCapture();
+    clearCurrentSessionLiveCaptions();
+  });
+
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", createPanel);
+    document.addEventListener("DOMContentLoaded", boot);
   } else {
-    createPanel();
+    boot();
   }
 })();

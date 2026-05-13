@@ -2,7 +2,8 @@ const fields = [
   "openaiApiKey",
   "openaiModel",
   "notionApiKey",
-  "notionParentPageId"
+  "notionParentPageId",
+  "chatgptProjectUrl"
 ];
 
 function getField(id) {
@@ -15,6 +16,7 @@ function loadOptions() {
     getField("openaiModel").value = items.openaiModel || "gpt-5-mini";
     getField("notionApiKey").value = items.notionApiKey || "";
     getField("notionParentPageId").value = items.notionParentPageId || "";
+    getField("chatgptProjectUrl").value = items.chatgptProjectUrl || "";
   });
 }
 

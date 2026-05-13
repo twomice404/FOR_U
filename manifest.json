@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Panopto 개념 정리 도우미",
-  "version": "1.0.0",
+  "version": "1.7.0",
   "description": "로그인된 Panopto 강의 페이지에서 대본 텍스트를 추출하고 개념 정리 노트를 만듭니다.",
   "permissions": ["storage"],
   "host_permissions": [
@@ -9,16 +9,23 @@
     "https://api.openai.com/*",
     "https://api.notion.com/*"
   ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page-hook.js"],
+      "matches": ["https://*.panopto.com/*"]
+    }
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "options_page": "options.html",
   "content_scripts": [
     {
-      "matches": ["https://*.panopto.com/Panopto/*"],
+      "matches": ["https://*.panopto.com/*"],
       "js": ["content.js"],
       "css": ["style.css"],
-      "run_at": "document_idle"
+      "run_at": "document_start",
+      "all_frames": true
     }
   ],
   "action": {

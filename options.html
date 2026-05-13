@@ -29,6 +29,11 @@
         <input id="notionParentPageId" type="text" placeholder="Notion 페이지 URL을 붙여넣어도 됩니다">
       </label>
 
+      <label>
+        ChatGPT 프로젝트 URL
+        <input id="chatgptProjectUrl" type="url" placeholder="https://chatgpt.com/... 프로젝트 링크">
+      </label>
+
       <div class="actions">
         <button id="save" type="button">저장</button>
         <span id="status"></span>
@@ -37,6 +42,11 @@
       <section>
         <h2>Notion 준비</h2>
         <p>Notion에서 새 통합을 만들고, 정리본을 넣을 페이지 오른쪽 위 메뉴에서 해당 통합을 초대해야 합니다.</p>
+      </section>
+
+      <section>
+        <h2>ChatGPT 프로젝트 사용</h2>
+        <p>API 비용 없이 쓰려면 ChatGPT에서 전용 프로젝트를 만든 뒤 그 프로젝트 URL을 저장하세요. 확장 프로그램이 대본과 요청문을 복사하고 해당 프로젝트를 열어줍니다.</p>
       </section>
     </main>
     <script src="options.js"></script>
