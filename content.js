@@ -17,6 +17,10 @@
     return `${LIVE_CAPTION_STORAGE_PREFIX}${getCurrentSessionId()}`;
   }
 
+  function getNotionPageStorageKey() {
+    return `panoptoNotionPage:${getCurrentSessionId()}`;
+  }
+
   const STOPWORDS = new Set([
     "그리고", "그러면", "그런데", "하지만", "입니다", "합니다", "있습니다", "수",
     "있는", "없는", "것", "거", "이", "그", "저", "때", "좀", "더", "등", "및",
@@ -777,8 +781,70 @@
     });
   }
 
-  function buildChatGptPrompt(transcript) {
-    const title = document.title.replace(/\s*-\s*Panopto.*$/i, "").trim() || "Panopto 강의";
+  function cleanLectureTitle(value) {
+    const title = normalizeText(value || "")
+      .replace(/\s*-\s*Panopto.*$/i, "")
+      .replace(/\s*\|\s*Panopto.*$/i, "")
+      .replace(/^Panopto\s*/i, "")
+      .trim();
+
+    if (!title) return "";
+    if (/^(Panopto|Embed|Viewer|Login|강의|대본|개념 정리)$/i.test(title)) return "";
+    if (/^https?:\/\//i.test(title)) return "";
+    if (title.length < 3) return "";
+    return title.slice(0, 120);
+  }
+
+  function getLectureTitleFromPage() {
+    const selectors = [
+      "meta[property='og:title']",
+      "meta[name='title']",
+      "h1",
+      "[class*='title' i]",
+      "[id*='title' i]",
+      "[aria-label*='title' i]"
+    ];
+
+    for (const selector of selectors) {
+      const elements = [...document.querySelectorAll(selector)].slice(0, 10);
+      for (const element of elements) {
+        const raw = element.getAttribute("content")
+          || element.getAttribute("aria-label")
+          || element.innerText
+          || element.textContent;
+        const title = cleanLectureTitle(raw);
+        if (title) return title;
+      }
+    }
+
+    return cleanLectureTitle(document.title);
+  }
+
+  async function getFallbackLectureTitle() {
+    const date = new Date().toISOString().slice(0, 10);
+    const sessionId = getCurrentSessionId();
+    const titleKey = `panoptoFallbackTitle:${sessionId}`;
+    const countKey = `panoptoFallbackTitleCount:${date}`;
+    const stored = await getLocalSettings([titleKey, countKey]);
+
+    if (stored[titleKey]) {
+      return stored[titleKey];
+    }
+
+    const order = Number(stored[countKey] || 0) + 1;
+    const title = `Panopto 강의 ${date} ${order}번째`;
+    await setLocalSettings({
+      [titleKey]: title,
+      [countKey]: order
+    });
+    return title;
+  }
+
+  async function getLectureTitle() {
+    return getLectureTitleFromPage() || await getFallbackLectureTitle();
+  }
+
+  function buildChatGptPrompt(transcript, title = getLectureTitleFromPage() || "Panopto 강의") {
     return [
       "아래 Panopto 강의 대본을 바탕으로 대학 수업 복습용 개념 정리본을 만들어줘.",
       "",
@@ -877,9 +943,10 @@
         </div>
 
         <div class="panopto-helper-section" data-panel-section="send">
-          <div class="panopto-helper-section-title">GPT 정리와 Notion 전송</div>
+          <div class="panopto-helper-section-title">Notion 업로드와 GPT 옵션</div>
           <div class="panopto-helper-upload-panel">
-            <button class="panopto-helper-button primary" type="button" data-action="upload-notion">GPT로 정리해서 Notion 업로드</button>
+            <button class="panopto-helper-button primary" type="button" data-action="upload-notion">Notion에 원문 업로드</button>
+            <button class="panopto-helper-button" type="button" data-action="gpt-update-notion">GPT 정리 후 Notion에 추가</button>
             <button class="panopto-helper-button" type="button" data-action="chatgpt-project">ChatGPT 프로젝트에서 정리</button>
           </div>
           <div class="panopto-helper-project-panel" hidden>
@@ -917,7 +984,10 @@
               ChatGPT 프로젝트 URL
               <input type="url" data-setting="chatgptProjectUrl" placeholder="https://chatgpt.com/...">
             </label>
-            <button class="panopto-helper-button primary" type="button" data-action="save-settings">설정 저장</button>
+            <div class="panopto-helper-inline-actions">
+              <button class="panopto-helper-button primary" type="button" data-action="save-settings">설정 저장</button>
+              <button class="panopto-helper-button" type="button" data-action="test-notion">Notion 연결 테스트</button>
+            </div>
           </div>
         </div>
       </div>
@@ -934,6 +1004,8 @@
     const transcriptActions = panel.querySelector(".panopto-helper-transcript-actions");
     const resultActions = panel.querySelector(".panopto-helper-result-actions");
     const liveCaptionButton = panel.querySelector('[data-action="toggle-live-captions"]');
+    let activeNotionPageId = "";
+    let activeNotionUrl = "";
 
     function updateLiveCaptionButton() {
       if (!liveCaptionButton) return;
@@ -965,6 +1037,35 @@
       });
     }
 
+    function setButtonBusy(button, label) {
+      if (!button.dataset.idleText) {
+        button.dataset.idleText = button.textContent;
+      }
+      button.classList.remove("is-done");
+      button.classList.add("is-working");
+      button.textContent = label;
+      button.disabled = true;
+    }
+
+    function clearButtonState(button) {
+      button.classList.remove("is-working", "is-done");
+      button.textContent = button.dataset.idleText || button.textContent;
+      button.disabled = false;
+    }
+
+    function markButtonDone(button, label) {
+      if (!button.dataset.idleText) {
+        button.dataset.idleText = button.textContent;
+      }
+      button.classList.remove("is-working");
+      button.classList.add("is-done");
+      button.textContent = label;
+      button.disabled = false;
+      setTimeout(() => {
+        clearButtonState(button);
+      }, 1800);
+    }
+
     async function loadSettingsIntoPanel() {
       const settings = await getLocalSettings([
         "openaiApiKey",
@@ -993,22 +1094,63 @@
 
       const saved = await setLocalSettings(items);
       setStatus(saved ? "설정을 저장했습니다." : "설정 저장에 실패했습니다.");
+      return items;
     }
 
-    async function loadStoredLiveCaptions() {
-      const result = await getLocalSettings([LIVE_CAPTION_STORAGE_KEY]);
-      const lines = Array.isArray(result[LIVE_CAPTION_STORAGE_KEY])
-        ? result[LIVE_CAPTION_STORAGE_KEY]
-        : [];
-      return uniqueLines(lines.join("\n"));
+    function getSettingsFromPanel() {
+      const items = {};
+      settingsPanel.querySelectorAll("[data-setting]").forEach((input) => {
+        items[input.dataset.setting] = input.value.trim();
+      });
+      if (!items.openaiModel) {
+        items.openaiModel = "gpt-5-mini";
+      }
+      return items;
     }
 
     async function clearStoredLiveCaptions() {
       await clearCurrentSessionLiveCaptions();
     }
 
+    async function loadSavedNotionPage() {
+      const key = getNotionPageStorageKey();
+      const saved = await getLocalSettings([key]);
+      const page = saved[key] || {};
+      activeNotionPageId = page.id || "";
+      activeNotionUrl = page.url || "";
+      return page;
+    }
+
+    async function saveNotionPage(page) {
+      activeNotionPageId = page.id || page.notionPageId || "";
+      activeNotionUrl = page.url || page.notionUrl || "";
+      await setLocalSettings({
+        [getNotionPageStorageKey()]: {
+          id: activeNotionPageId,
+          url: activeNotionUrl,
+          title: page.title || "",
+          savedAt: Date.now()
+        }
+      });
+    }
+
+    async function ensureTranscriptText() {
+      if (!textarea.value.trim()) {
+        textarea.value = await extractTranscriptDeep();
+      }
+      if (!textarea.value.trim()) {
+        throw new Error("대본을 먼저 추출하거나 붙여넣어 주세요.");
+      }
+      transcriptActions.hidden = false;
+      return textarea.value;
+    }
+
     function setStatus(message) {
       status.textContent = message;
+    }
+
+    function isSettingsError(message) {
+      return /OpenAI API 키|Notion API 키|Notion 토큰|Integration Token|부모 페이지|접근할 수 없습니다|초대해 주세요|API token is invalid|unauthorized|restricted_resource|not found|설정/i.test(message || "");
     }
 
     toggle.addEventListener("click", () => {
@@ -1028,6 +1170,11 @@
         showSection(button.dataset.section);
         if (button.dataset.section === "settings") {
           await loadSettingsIntoPanel();
+        } else if (button.dataset.section === "send") {
+          const savedPage = await loadSavedNotionPage();
+          if (savedPage.url) {
+            setStatus(`전송 화면입니다. 최근 Notion 페이지: ${savedPage.url}`);
+          }
         }
         return;
       }
@@ -1042,7 +1189,7 @@
       }
 
       if (action === "extract") {
-        button.disabled = true;
+        setButtonBusy(button, "대본 추출 중...");
         markWorking(action);
         startLiveCaptionCapture();
         setStatus("대본을 찾는 중입니다. 자막/대본 패널, 영상 자막 트랙, 재생 중 자막을 함께 확인합니다.");
@@ -1052,11 +1199,14 @@
           transcriptActions.hidden = !extracted;
           if (extracted) setCollapsed("transcript", false);
           setStatus(extracted ? `대본 후보를 ${extracted.length.toLocaleString("ko-KR")}자 추출했습니다.` : `자동 추출에 실패했습니다. ${getExtractionDiagnostics()}`);
+          if (extracted) markButtonDone(button, "대본 추출 완료");
         } catch (error) {
           setStatus(error.message || String(error));
         } finally {
           markWorking("");
-          button.disabled = false;
+          if (!button.classList.contains("is-done")) {
+            clearButtonState(button);
+          }
         }
       }
 
@@ -1108,11 +1258,75 @@
         markWorking("");
       }
 
+      if (action === "test-notion") {
+        setButtonBusy(button, "Notion 확인 중...");
+        markWorking(action);
+        setStatus("Notion 부모 페이지 접근을 확인하는 중입니다.");
+
+        try {
+          const settings = getSettingsFromPanel();
+          await setLocalSettings(settings);
+          const response = await sendRuntimeMessage({
+            type: "testNotionConnection",
+            payload: {
+              notionApiKey: settings.notionApiKey,
+              notionParentPageId: settings.notionParentPageId
+            }
+          });
+
+          if (!response?.ok) {
+            throw new Error(response?.error || "Notion 연결 테스트에 실패했습니다.");
+          }
+
+          const page = response.result;
+          setStatus(`Notion 연결 확인 완료: ${page.title} (${page.pageId})`);
+          markButtonDone(button, "Notion 연결 확인 완료");
+        } catch (error) {
+          setStatus(error.message || String(error));
+        } finally {
+          markWorking("");
+          if (!button.classList.contains("is-done")) {
+            clearButtonState(button);
+          }
+        }
+      }
+
       if (action === "chatgpt-project") {
-        projectPanel.hidden = false;
-        projectUrlInput.value = await getLocalSetting("chatgptProjectUrl");
-        projectUrlInput.focus();
-        setStatus("ChatGPT 프로젝트 링크를 확인한 뒤 프로젝트를 여세요.");
+        const savedProjectUrl = (await getLocalSetting("chatgptProjectUrl")).trim();
+        if (savedProjectUrl) {
+          projectPanel.hidden = true;
+          projectUrlInput.value = savedProjectUrl;
+          setButtonBusy(button, "프로젝트 여는 중...");
+          markWorking(action);
+          setStatus("ChatGPT 프로젝트에 붙여넣을 프롬프트를 준비하는 중입니다.");
+
+          try {
+            if (!textarea.value.trim()) {
+              textarea.value = await extractTranscriptDeep();
+            }
+
+            if (!textarea.value.trim()) {
+              throw new Error("대본을 먼저 추출하거나 붙여넣어 주세요.");
+            }
+
+            await copyToClipboard(buildChatGptPrompt(textarea.value, await getLectureTitle()));
+            window.open(savedProjectUrl, "_blank", "noopener,noreferrer");
+            setStatus("프롬프트를 복사했고 설정된 ChatGPT 프로젝트를 열었습니다. 프로젝트 채팅 입력창에 붙여넣으면 됩니다.");
+            markButtonDone(button, "프로젝트 열기 완료");
+          } catch (error) {
+            setStatus(error.message || String(error));
+          } finally {
+            markWorking("");
+            if (!button.classList.contains("is-done")) {
+              clearButtonState(button);
+            }
+          }
+        } else {
+          projectPanel.hidden = false;
+          projectUrlInput.value = "";
+          projectUrlInput.focus();
+          setStatus("설정된 ChatGPT 프로젝트 URL이 없습니다. 프로젝트 링크를 입력해 주세요.");
+        }
       }
 
       if (action === "close-chatgpt-project") {
@@ -1120,7 +1334,7 @@
       }
 
       if (action === "open-chatgpt-project") {
-        button.disabled = true;
+        setButtonBusy(button, "프로젝트 여는 중...");
         markWorking(action);
         setStatus("ChatGPT 프로젝트에 붙여넣을 프롬프트를 준비하는 중입니다.");
 
@@ -1136,32 +1350,33 @@
             throw new Error("대본을 먼저 추출하거나 붙여넣어 주세요.");
           }
 
-          await copyToClipboard(buildChatGptPrompt(textarea.value));
+          await copyToClipboard(buildChatGptPrompt(textarea.value, await getLectureTitle()));
           window.open(projectUrl || "https://chatgpt.com/", "_blank", "noopener,noreferrer");
           setStatus("프롬프트를 복사했고 ChatGPT를 열었습니다. 프로젝트 채팅 입력창에 붙여넣으면 됩니다.");
+          markButtonDone(button, "프로젝트 열기 완료");
         } catch (error) {
           setStatus(error.message || String(error));
         } finally {
           markWorking("");
-          button.disabled = false;
+          if (!button.classList.contains("is-done")) {
+            clearButtonState(button);
+          }
         }
       }
 
       if (action === "upload-notion") {
-        button.disabled = true;
+        setButtonBusy(button, "Notion 업로드 중...");
         markWorking(action);
-        setStatus("OpenAI로 정리한 뒤 Notion에 업로드하는 중입니다.");
+        setStatus("대본 원문을 Notion에 업로드하는 중입니다.");
 
         try {
-          if (!textarea.value.trim()) {
-            textarea.value = await extractTranscriptDeep();
-          }
+          const transcript = await ensureTranscriptText();
 
           const response = await sendRuntimeMessage({
-            type: "summarizeAndUploadToNotion",
+            type: "uploadTranscriptToNotion",
             payload: {
-              transcript: textarea.value,
-              title: document.title.replace(/\s*-\s*Panopto.*$/i, "").trim(),
+              transcript,
+              title: await getLectureTitle(),
               pageUrl: location.href
             }
           });
@@ -1170,20 +1385,68 @@
             throw new Error(response?.error || "업로드에 실패했습니다.");
           }
 
-          output.textContent = response.result.summary;
-          resultActions.hidden = !output.textContent.trim();
-          if (output.textContent.trim()) setCollapsed("result", false);
+          await saveNotionPage(response.result);
           const notionUrl = response.result.notionUrl;
-          setStatus(notionUrl ? `Notion 업로드 완료: ${notionUrl}` : "Notion 업로드 완료");
+          setStatus(notionUrl ? `원문 대본을 Notion에 업로드했습니다: ${notionUrl}` : "원문 대본을 Notion에 업로드했습니다.");
+          markButtonDone(button, "Notion 업로드 완료");
         } catch (error) {
-          if (/OpenAI API 키|Notion API 키|부모 페이지 ID|설정/.test(error.message || "")) {
+          if (isSettingsError(error.message)) {
             showSection("settings");
             await loadSettingsIntoPanel();
           }
           setStatus(error.message || String(error));
         } finally {
           markWorking("");
-          button.disabled = false;
+          if (!button.classList.contains("is-done")) {
+            clearButtonState(button);
+          }
+        }
+      }
+
+      if (action === "gpt-update-notion") {
+        setButtonBusy(button, "GPT 정리 추가 중...");
+        markWorking(action);
+        setStatus("GPT로 정리한 뒤 Notion 페이지에 추가하는 중입니다.");
+
+        try {
+          const transcript = await ensureTranscriptText();
+          if (!activeNotionPageId) {
+            await loadSavedNotionPage();
+          }
+
+          const response = await sendRuntimeMessage({
+            type: "summarizeAndUploadToNotion",
+            payload: {
+              transcript,
+              title: await getLectureTitle(),
+              pageUrl: location.href,
+              notionPageId: activeNotionPageId,
+              notionUrl: activeNotionUrl
+            }
+          });
+
+          if (!response?.ok) {
+            throw new Error(response?.error || "GPT 정리 또는 Notion 갱신에 실패했습니다.");
+          }
+
+          await saveNotionPage(response.result);
+          output.textContent = response.result.summary;
+          resultActions.hidden = !output.textContent.trim();
+          if (output.textContent.trim()) setCollapsed("result", false);
+          const notionUrl = response.result.notionUrl;
+          setStatus(notionUrl ? `GPT 정리본을 Notion에 추가했습니다: ${notionUrl}` : "GPT 정리본을 Notion에 추가했습니다.");
+          markButtonDone(button, "GPT 정리 추가 완료");
+        } catch (error) {
+          if (isSettingsError(error.message)) {
+            showSection("settings");
+            await loadSettingsIntoPanel();
+          }
+          setStatus(error.message || String(error));
+        } finally {
+          markWorking("");
+          if (!button.classList.contains("is-done")) {
+            clearButtonState(button);
+          }
         }
       }
 
