@@ -237,6 +237,48 @@
   background: #f9fafb;
 }
 
+.panopto-helper-setting-group {
+  display: grid;
+  gap: 9px;
+  padding: 9px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #ffffff;
+}
+
+.panopto-helper-setting-group summary {
+  color: #111827;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.panopto-helper-setting-group[open] summary {
+  margin-bottom: 8px;
+}
+
+.panopto-helper-setting-status {
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #f9fafb;
+  color: #4b5563;
+  padding: 7px 8px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.panopto-helper-setting-status[data-state="ok"] {
+  border-color: #16a34a;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.panopto-helper-setting-status[data-state="error"] {
+  border-color: #dc2626;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
 .panopto-helper-project-panel[hidden] {
   display: none;
 }

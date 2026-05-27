@@ -154,6 +154,31 @@ function richText(content) {
   return [{ type: "text", text: { content: content.slice(0, 2000) } }];
 }
 
+function headingBlock(level, content) {
+  const type = `heading_${level}`;
+  return {
+    object: "block",
+    type,
+    [type]: { rich_text: richText(content) }
+  };
+}
+
+function paragraphBlock(content) {
+  return {
+    object: "block",
+    type: "paragraph",
+    paragraph: { rich_text: richText(content) }
+  };
+}
+
+function bulletBlock(content) {
+  return {
+    object: "block",
+    type: "bulleted_list_item",
+    bulleted_list_item: { rich_text: richText(content) }
+  };
+}
+
 function makeParagraphBlocks(text, options = {}) {
   const blocks = [];
   const limit = Number.isFinite(options.limit) ? options.limit : Infinity;
@@ -163,36 +188,16 @@ function makeParagraphBlocks(text, options = {}) {
     if (!line) continue;
 
     if (line.startsWith("### ")) {
-      blocks.push({
-        object: "block",
-        type: "heading_3",
-        heading_3: { rich_text: richText(line.slice(4)) }
-      });
+      blocks.push(headingBlock(3, line.slice(4)));
     } else if (line.startsWith("## ")) {
-      blocks.push({
-        object: "block",
-        type: "heading_2",
-        heading_2: { rich_text: richText(line.slice(3)) }
-      });
+      blocks.push(headingBlock(2, line.slice(3)));
     } else if (line.startsWith("# ")) {
-      blocks.push({
-        object: "block",
-        type: "heading_1",
-        heading_1: { rich_text: richText(line.slice(2)) }
-      });
+      blocks.push(headingBlock(1, line.slice(2)));
     } else if (line.startsWith("- ")) {
-      blocks.push({
-        object: "block",
-        type: "bulleted_list_item",
-        bulleted_list_item: { rich_text: richText(line.slice(2)) }
-      });
+      blocks.push(bulletBlock(line.slice(2)));
     } else {
       for (let i = 0; i < line.length; i += 1900) {
-        blocks.push({
-          object: "block",
-          type: "paragraph",
-          paragraph: { rich_text: richText(line.slice(i, i + 1900)) }
-        });
+        blocks.push(paragraphBlock(line.slice(i, i + 1900)));
       }
     }
   }
@@ -226,19 +231,11 @@ async function createNotionPage({ apiKey, parentPageId, title, content, sourceUr
 
   const contentBlocks = makeParagraphBlocks(content);
   const children = [
-    {
-      object: "block",
-      type: "paragraph",
-      paragraph: {
-        rich_text: richText(sourceUrl ? `원본 Panopto 링크: ${sourceUrl}` : "원본 Panopto 링크 없음")
-      }
-    },
-    {
-      object: "block",
-      type: "heading_2",
-      heading_2: { rich_text: richText(contentLabel) }
-    },
-    ...contentBlocks.slice(0, 98)
+    headingBlock(2, "강의 정보"),
+    bulletBlock(sourceUrl ? `원본 Panopto 링크: ${sourceUrl}` : "원본 Panopto 링크 없음"),
+    bulletBlock(`생성 시각: ${new Date().toLocaleString("ko-KR")}`),
+    headingBlock(2, contentLabel),
+    ...contentBlocks.slice(0, 96)
   ];
 
   const response = await fetch("https://api.notion.com/v1/pages", {
@@ -265,7 +262,7 @@ async function createNotionPage({ apiKey, parentPageId, title, content, sourceUr
     throw new Error(message);
   }
 
-  for (let index = 98; index < contentBlocks.length; index += 100) {
+  for (let index = 96; index < contentBlocks.length; index += 100) {
     await appendNotionBlocks({
       apiKey,
       blockId: data.id,
@@ -279,6 +276,32 @@ async function createNotionPage({ apiKey, parentPageId, title, content, sourceUr
   };
 }
 
+async function appendContentToPage({ apiKey, pageId, content, contentLabel }) {
+  const targetPageId = normalizeNotionId(pageId);
+  if (!targetPageId) {
+    throw new Error("갱신할 Notion 페이지 ID가 올바르지 않습니다.");
+  }
+
+  const contentBlocks = makeParagraphBlocks(content);
+  await appendNotionBlocks({
+    apiKey,
+    blockId: targetPageId,
+    blocks: [
+      headingBlock(2, contentLabel),
+      bulletBlock(`추가 시각: ${new Date().toLocaleString("ko-KR")}`),
+      ...contentBlocks.slice(0, 96)
+    ]
+  });
+
+  for (let index = 96; index < contentBlocks.length; index += 100) {
+    await appendNotionBlocks({
+      apiKey,
+      blockId: targetPageId,
+      blocks: contentBlocks.slice(index, index + 100)
+    });
+  }
+}
+
 async function appendSummaryToPage({ apiKey, pageId, summary }) {
   const targetPageId = normalizeNotionId(pageId);
   if (!targetPageId) {
@@ -289,11 +312,7 @@ async function appendSummaryToPage({ apiKey, pageId, summary }) {
     apiKey,
     blockId: targetPageId,
     blocks: [
-      {
-        object: "block",
-        type: "heading_2",
-        heading_2: { rich_text: richText("GPT 정리본") }
-      },
+      headingBlock(2, "GPT 정리본"),
       ...makeParagraphBlocks(summary, { limit: 99 })
     ]
   });
@@ -315,10 +334,36 @@ async function handleUploadTranscript(payload) {
     title: pageTitle,
     content: payload.transcript,
     sourceUrl: payload.pageUrl,
-    contentLabel: "원문 대본"
+    contentLabel: "정돈 대본"
   });
 
   return { notionPageId: notionPage.id, notionUrl: notionPage.url, title: pageTitle };
+}
+
+async function handleAppendTranscript(payload) {
+  const settings = await getSettings();
+  if (!settings.notionApiKey) {
+    throw new Error("Notion API 키가 설정되어 있지 않습니다.");
+  }
+  if (!payload.notionPageId) {
+    throw new Error("갱신할 Notion 페이지가 없습니다. 먼저 새 페이지로 업로드해 주세요.");
+  }
+  if (!payload.transcript || payload.transcript.trim().length < 20) {
+    throw new Error("추가할 정돈 텍스트가 너무 짧습니다.");
+  }
+
+  await appendContentToPage({
+    apiKey: settings.notionApiKey,
+    pageId: payload.notionPageId,
+    content: payload.transcript,
+    contentLabel: "정돈 대본 갱신"
+  });
+
+  return {
+    notionPageId: payload.notionPageId,
+    notionUrl: payload.notionUrl || "",
+    title: payload.title || ""
+  };
 }
 
 async function handleTestNotionConnection(payload) {
@@ -356,7 +401,7 @@ async function handleSummarizeAndUpload(payload) {
       title: pageTitle,
       content: payload.transcript,
       sourceUrl: payload.pageUrl,
-      contentLabel: "원문 대본"
+      contentLabel: "정돈 대본"
     });
     notionPageId = notionPage.id;
     notionUrl = notionPage.url;
@@ -382,6 +427,7 @@ async function handleSummarizeAndUpload(payload) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const handlers = {
     testNotionConnection: handleTestNotionConnection,
+    appendTranscriptToNotion: handleAppendTranscript,
     uploadTranscriptToNotion: handleUploadTranscript,
     summarizeAndUploadToNotion: handleSummarizeAndUpload
   };

@@ -709,6 +709,16 @@
     return false;
   }
 
+  function getTidyDuplicateKey(line) {
+    return normalizeText(line)
+      .replace(/[\s.,!?。！？·~\-–—:;"'“”‘’()\[\]{}]/g, "")
+      .toLowerCase();
+  }
+
+  function shouldStartNewParagraph(line) {
+    return /^(첫째|둘째|셋째|다음|먼저|그리고|그런데|하지만|또한|그래서|따라서|즉|예를 들어|정리하면|결론적으로|반면|한편)/.test(line);
+  }
+
   function tidyTranscript(text) {
     const cleanText = normalizeText(text);
 
@@ -716,10 +726,18 @@
       return "정돈할 텍스트가 너무 짧습니다. 대본을 먼저 추출하거나 붙여넣어 주세요.";
     }
 
+    const seen = new Set();
     const lines = cleanText
       .split(/\n+/)
       .map((line) => normalizeText(line))
-      .filter((line) => !looksLikeNoiseLine(line));
+      .filter((line) => !looksLikeNoiseLine(line))
+      .filter((line) => {
+        const key = getTidyDuplicateKey(line);
+        if (key.length < 3) return false;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
 
     const merged = [];
     lines.forEach((line) => {
@@ -727,9 +745,10 @@
       const previous = merged[merged.length - 1] || "";
       const shouldAppend =
         previous &&
-        previous.length < 90 &&
+        previous.length < 110 &&
+        line.length < 120 &&
         !/[.!?。！？]$/.test(previous) &&
-        !/^(그리고|그런데|하지만|또한|그래서|따라서|즉|예를 들어)/.test(line);
+        !shouldStartNewParagraph(line);
 
       if (shouldAppend) {
         merged[merged.length - 1] = `${previous} ${line}`;
@@ -738,7 +757,18 @@
       }
     });
 
-    return uniqueLines(merged.join("\n"));
+    const paragraphs = [];
+    let current = [];
+    merged.forEach((line) => {
+      if (current.length >= 4 || (current.length && shouldStartNewParagraph(line))) {
+        paragraphs.push(current.join("\n"));
+        current = [];
+      }
+      current.push(line);
+    });
+    if (current.length) paragraphs.push(current.join("\n"));
+
+    return paragraphs.join("\n\n");
   }
 
   async function copyToClipboard(text) {
@@ -945,8 +975,9 @@
         <div class="panopto-helper-section" data-panel-section="send">
           <div class="panopto-helper-section-title">Notion 업로드와 GPT 옵션</div>
           <div class="panopto-helper-upload-panel">
-            <button class="panopto-helper-button primary" type="button" data-action="upload-notion">Notion에 원문 업로드</button>
+            <button class="panopto-helper-button primary" type="button" data-action="upload-notion">Notion에 정돈 텍스트 업로드</button>
             <button class="panopto-helper-button" type="button" data-action="gpt-update-notion">GPT 정리 후 Notion에 추가</button>
+            <button class="panopto-helper-button" type="button" data-action="open-notion-page" hidden>최근 Notion 페이지 열기</button>
             <button class="panopto-helper-button" type="button" data-action="chatgpt-project">ChatGPT 프로젝트에서 정리</button>
           </div>
           <div class="panopto-helper-project-panel" hidden>
@@ -964,29 +995,41 @@
         <div class="panopto-helper-section" data-panel-section="settings">
           <div class="panopto-helper-section-title">연동 설정</div>
           <div class="panopto-helper-settings">
-            <label>
-              OpenAI API Key
-              <input type="password" data-setting="openaiApiKey" placeholder="sk-...">
-            </label>
-            <label>
-              OpenAI Model
-              <input type="text" data-setting="openaiModel" placeholder="gpt-5-mini">
-            </label>
-            <label>
-              Notion Integration Token
-              <input type="password" data-setting="notionApiKey" placeholder="ntn_... 또는 secret_...">
-            </label>
-            <label>
-              Notion 부모 페이지 URL 또는 ID
-              <input type="text" data-setting="notionParentPageId" placeholder="Notion 페이지 URL을 붙여넣으세요">
-            </label>
-            <label>
-              ChatGPT 프로젝트 URL
-              <input type="url" data-setting="chatgptProjectUrl" placeholder="https://chatgpt.com/...">
-            </label>
+            <details class="panopto-helper-setting-group" open>
+              <summary>Notion 설정</summary>
+              <div class="panopto-helper-setting-status" data-notion-status>Notion 연결 상태: 확인 전</div>
+              <label>
+                Notion Integration Token
+                <input type="password" data-setting="notionApiKey" placeholder="ntn_... 또는 secret_...">
+              </label>
+              <label>
+                Notion 부모 페이지 URL 또는 ID
+                <input type="text" data-setting="notionParentPageId" placeholder="Notion 페이지 URL을 붙여넣으세요">
+              </label>
+              <div class="panopto-helper-inline-actions">
+                <button class="panopto-helper-button" type="button" data-action="test-notion">Notion 연결 테스트</button>
+              </div>
+            </details>
+            <details class="panopto-helper-setting-group">
+              <summary>OpenAI 설정</summary>
+              <label>
+                OpenAI API Key
+                <input type="password" data-setting="openaiApiKey" placeholder="sk-...">
+              </label>
+              <label>
+                OpenAI Model
+                <input type="text" data-setting="openaiModel" placeholder="gpt-5-mini">
+              </label>
+            </details>
+            <details class="panopto-helper-setting-group">
+              <summary>ChatGPT 프로젝트 설정</summary>
+              <label>
+                ChatGPT 프로젝트 URL
+                <input type="url" data-setting="chatgptProjectUrl" placeholder="https://chatgpt.com/...">
+              </label>
+            </details>
             <div class="panopto-helper-inline-actions">
               <button class="panopto-helper-button primary" type="button" data-action="save-settings">설정 저장</button>
-              <button class="panopto-helper-button" type="button" data-action="test-notion">Notion 연결 테스트</button>
             </div>
           </div>
         </div>
@@ -1004,6 +1047,8 @@
     const transcriptActions = panel.querySelector(".panopto-helper-transcript-actions");
     const resultActions = panel.querySelector(".panopto-helper-result-actions");
     const liveCaptionButton = panel.querySelector('[data-action="toggle-live-captions"]');
+    const openNotionButton = panel.querySelector('[data-action="open-notion-page"]');
+    const notionStatus = panel.querySelector("[data-notion-status]");
     let activeNotionPageId = "";
     let activeNotionUrl = "";
 
@@ -1094,6 +1139,7 @@
 
       const saved = await setLocalSettings(items);
       setStatus(saved ? "설정을 저장했습니다." : "설정 저장에 실패했습니다.");
+      if (saved) setNotionStatus("Notion 연결 상태: 확인 전", "");
       return items;
     }
 
@@ -1112,18 +1158,31 @@
       await clearCurrentSessionLiveCaptions();
     }
 
+    function updateNotionPageButton() {
+      if (!openNotionButton) return;
+      openNotionButton.hidden = !activeNotionUrl;
+    }
+
+    function setNotionStatus(message, state = "") {
+      if (!notionStatus) return;
+      notionStatus.textContent = message;
+      notionStatus.dataset.state = state;
+    }
+
     async function loadSavedNotionPage() {
       const key = getNotionPageStorageKey();
       const saved = await getLocalSettings([key]);
       const page = saved[key] || {};
       activeNotionPageId = page.id || "";
       activeNotionUrl = page.url || "";
+      updateNotionPageButton();
       return page;
     }
 
     async function saveNotionPage(page) {
       activeNotionPageId = page.id || page.notionPageId || "";
       activeNotionUrl = page.url || page.notionUrl || "";
+      updateNotionPageButton();
       await setLocalSettings({
         [getNotionPageStorageKey()]: {
           id: activeNotionPageId,
@@ -1143,6 +1202,18 @@
       }
       transcriptActions.hidden = false;
       return textarea.value;
+    }
+
+    async function ensureTidyText() {
+      const transcript = await ensureTranscriptText();
+      const tidied = tidyTranscript(transcript);
+      if (!tidied.trim() || /^정돈할 텍스트가 너무 짧습니다/.test(tidied)) {
+        throw new Error("Notion에 보낼 정돈 텍스트가 없습니다. 대본을 먼저 추출하거나 붙여넣어 주세요.");
+      }
+      output.textContent = tidied;
+      resultActions.hidden = false;
+      setCollapsed("result", false);
+      return tidied;
     }
 
     function setStatus(message) {
@@ -1279,9 +1350,11 @@
           }
 
           const page = response.result;
+          setNotionStatus(`Notion 연결 상태: 정상 · ${page.title}`, "ok");
           setStatus(`Notion 연결 확인 완료: ${page.title} (${page.pageId})`);
           markButtonDone(button, "Notion 연결 확인 완료");
         } catch (error) {
+          setNotionStatus("Notion 연결 상태: 확인 실패", "error");
           setStatus(error.message || String(error));
         } finally {
           markWorking("");
@@ -1367,17 +1440,24 @@
       if (action === "upload-notion") {
         setButtonBusy(button, "Notion 업로드 중...");
         markWorking(action);
-        setStatus("대본 원문을 Notion에 업로드하는 중입니다.");
+        setStatus("정돈된 텍스트를 Notion에 업로드하는 중입니다.");
 
         try {
-          const transcript = await ensureTranscriptText();
+          const transcript = await ensureTidyText();
+          await loadSavedNotionPage();
+          const title = await getLectureTitle();
+          const shouldAppendToExisting = activeNotionPageId
+            ? window.confirm("이미 이 영상으로 만든 Notion 페이지가 있습니다.\n\n확인: 기존 페이지에 정돈 대본 갱신 추가\n취소: 새 하위 페이지 생성")
+            : false;
 
           const response = await sendRuntimeMessage({
-            type: "uploadTranscriptToNotion",
+            type: shouldAppendToExisting ? "appendTranscriptToNotion" : "uploadTranscriptToNotion",
             payload: {
               transcript,
-              title: await getLectureTitle(),
-              pageUrl: location.href
+              title,
+              pageUrl: location.href,
+              notionPageId: activeNotionPageId,
+              notionUrl: activeNotionUrl
             }
           });
 
@@ -1387,8 +1467,8 @@
 
           await saveNotionPage(response.result);
           const notionUrl = response.result.notionUrl;
-          setStatus(notionUrl ? `원문 대본을 Notion에 업로드했습니다: ${notionUrl}` : "원문 대본을 Notion에 업로드했습니다.");
-          markButtonDone(button, "Notion 업로드 완료");
+          setStatus(notionUrl ? `정돈된 텍스트를 Notion에 ${shouldAppendToExisting ? "추가" : "업로드"}했습니다: ${notionUrl}` : `정돈된 텍스트를 Notion에 ${shouldAppendToExisting ? "추가" : "업로드"}했습니다.`);
+          markButtonDone(button, shouldAppendToExisting ? "Notion 추가 완료" : "Notion 업로드 완료");
         } catch (error) {
           if (isSettingsError(error.message)) {
             showSection("settings");
@@ -1403,13 +1483,22 @@
         }
       }
 
+      if (action === "open-notion-page") {
+        if (activeNotionUrl) {
+          window.open(activeNotionUrl, "_blank", "noopener,noreferrer");
+          setStatus("최근 Notion 페이지를 열었습니다.");
+        } else {
+          setStatus("아직 연결된 Notion 페이지가 없습니다.");
+        }
+      }
+
       if (action === "gpt-update-notion") {
         setButtonBusy(button, "GPT 정리 추가 중...");
         markWorking(action);
         setStatus("GPT로 정리한 뒤 Notion 페이지에 추가하는 중입니다.");
 
         try {
-          const transcript = await ensureTranscriptText();
+          const transcript = await ensureTidyText();
           if (!activeNotionPageId) {
             await loadSavedNotionPage();
           }
